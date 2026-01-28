@@ -1,4 +1,3 @@
-
 package com.example.myvitalsandroid
 
 import android.annotation.SuppressLint
@@ -201,6 +200,9 @@ class VitalsService : Service() {
 
                 if (newState == BluetoothProfile.STATE_CONNECTED) {
                     Log.i(TAG, "🟢 Connected to $deviceAddr. Discovering services...")
+                    Handler(Looper.getMainLooper()).post {
+                        Toast.makeText(this@VitalsService, "Wristband Connected", Toast.LENGTH_SHORT).show()
+                    }
                     bridgeHandler.sendSignalToWeb("Connected")
                     gatt.discoverServices()
                 } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
@@ -395,6 +397,9 @@ class VitalsService : Service() {
         }
         bluetoothGatt = null
         bridgeHandler.sendSignalToWeb("Disconnected")
+        Handler(Looper.getMainLooper()).post {
+            Toast.makeText(this@VitalsService, "Wristband Disconnected", Toast.LENGTH_SHORT).show()
+        }
     }
 
     private fun hasScanPermission() = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) ContextCompat.checkSelfPermission(this, android.Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED else true
