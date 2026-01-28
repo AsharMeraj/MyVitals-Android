@@ -1,3 +1,4 @@
+
 package com.example.myvitalsandroid
 
 import android.annotation.SuppressLint
@@ -10,6 +11,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.*
 import android.util.Log
+import android.widget.Toast
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import com.jstyle.blesdk2208a.Util.BleSDK
@@ -17,9 +19,14 @@ import com.jstyle.blesdk2208a.Util.ResolveUtil
 import okhttp3.OkHttpClient
 import java.util.*
 import java.util.concurrent.TimeUnit
-import java.text.NumberFormat
 
 class VitalsService : Service() {
+
+    companion object {
+        const val SAMPLES_REQUIRED = 10
+        const val STALE_FILTER_DURATION = 1500L
+        const val DEFAULT_SESSION_TIMEOUT = 60
+    }
 
     private val TAG = "VitalsService"
 
@@ -34,130 +41,135 @@ class VitalsService : Service() {
     private val client = OkHttpClient.Builder().callTimeout(15, TimeUnit.SECONDS).build()
     private lateinit var bridgeHandler: KioskBridgeHandler
     private lateinit var gattCallback: BluetoothGattCallback
-    private var ignoreDataUntil: Long = 0
 
     private var pendingSpo2: Int? = null
     private var pendingHr: String? = null
     private var pendingTemp: String? = null
-    private var isManualDisconnect = false
 
-    // Session tracking to distinguish between active measurement and background sync
+    private var spo2Counter = 0
+    private var hrCounter = 0
+    private var tempCounter = 0
+
     private var isSessionActive = false
+    private var isManualDisconnect = false
+    private var ignoreDataUntil: Long = 0
 
-    // Watchdog to detect when packets stop coming
-    private val watchdogHandler = Handler(Looper.getMainLooper())
-    private val watchdogRunnable = Runnable {
-        transmitFinalVitals()
+    private val timeoutHandler = Handler(Looper.getMainLooper())
+    private var sessionTimeoutRunnable: Runnable? = null
+
+    @SuppressLint("MissingPermission")
+    private fun stopDeviceSensors() {
+        val gatt = bluetoothGatt ?: return
+        writeChar?.let { wChar ->
+            Log.i(TAG, "📤 Sending STOP commands to sensors...")
+
+            // Stop real-time data stream
+            wChar.value = BleSDK.RealTimeStep(false, false)
+            gatt.writeCharacteristic(wChar)
+
+            // Close measurement UI on watch screen
+            Handler(Looper.getMainLooper()).postDelayed({
+                Log.d(TAG, "📤 Closing watch measurement UI...")
+                wChar.value = BleSDK.StartDeviceMeasurementWithType(3, false, 30)
+                gatt.writeCharacteristic(wChar)
+            }, 500)
+        }
     }
 
-    /**
-     * Resets the 2.5-second timer. If this function isn't called for 2.5s,
-     * we assume the sensor has finished.
-     */
-    private fun resetWatchdog() {
-        watchdogHandler.removeCallbacks(watchdogRunnable)
-        watchdogHandler.postDelayed(watchdogRunnable, 2500)
-    }
-
-    /**
-     * Transmits the final captured values once the stream has ended.
-     */
-    private fun transmitFinalVitals() {
-        // Guard: Only process if we were actually expecting a measurement
+    private fun transmitFinalVitalsAndStop(reason: String = "STABILIZED") {
         if (!isSessionActive) return
+        Log.i(TAG, "🏁 Session Ending. Reason: $reason")
+
+        sessionTimeoutRunnable?.let { timeoutHandler.removeCallbacks(it) }
+        sessionTimeoutRunnable = null
+        isSessionActive = false
 
         val h = pendingHr ?: "0"
         val t = pendingTemp ?: "0.0"
         val s = pendingSpo2 ?: 0
 
-        if (h != "0" && s > 0 && t != "0.0") {
-            Log.i(TAG, "🏁 Sensor stream stopped. Transmitting final result: HR:$h, SpO2:$s, Temp:$t")
+        Log.i(TAG, "📊 FINAL DATA -> HR: $h, SpO2: $s%, Temp: $t°C")
 
-            // Mark session as finished BEFORE sending to avoid race conditions with trailing packets
-            isSessionActive = false
-            watchdogHandler.removeCallbacks(watchdogRunnable)
+        stopDeviceSensors()
+        bridgeHandler.sendVitalsToWeb(s.toString(), h, t, System.currentTimeMillis().toString())
+        bridgeHandler.sendSignalToWeb("IDLE")
 
-            // Notify UI that we are back to IDLE
-            bridgeHandler.sendSignalToWeb("IDLE")
-
-            // Send the final snapshot
-            bridgeHandler.sendVitalsToWeb(s.toString(), h, t, System.currentTimeMillis().toString())
-
-            // Clear buffers for the next session
-            pendingHr = null
-            pendingTemp = null
-            pendingSpo2 = null
-        } else {
-            // Only log warning and reset if we were actually in a session
-            Log.w(TAG, "⚠️ Stream stopped but no valid vitals were captured.")
-            isSessionActive = false
-            bridgeHandler.sendSignalToWeb("IDLE")
-        }
+        spo2Counter = 0
+        hrCounter = 0
+        tempCounter = 0
     }
 
     fun updateWristbandMacAndScan(mac: String) {
+        Log.i(TAG, "📍 New Target MAC: $mac. Preparing scan...")
         this.wristbandMac = mac
-        Log.d(TAG, "🔎 Updating MAC to $mac and starting scan...")
         if (hasScanPermission() && hasConnectPermission()) {
             startScanSafe()
         } else {
-            Log.e(TAG, "❌ Bluetooth permissions missing!")
+            Log.e(TAG, "❌ Missing Bluetooth permissions for scanning.")
         }
     }
 
-    fun startManualVitals() {
+    fun startManualVitals(timeoutSec: Int = DEFAULT_SESSION_TIMEOUT) {
         bluetoothGatt?.let { gatt ->
-            Log.i(TAG, "⚡ Manual Trigger: Connection active, starting sensors...")
+            Log.i(TAG, "⚡ Starting Measurement Session ($timeoutSec seconds timeout)")
+
+            spo2Counter = 0
+            hrCounter = 0
+            tempCounter = 0
+            pendingHr = null
+            pendingTemp = null
+            pendingSpo2 = null
+            ignoreDataUntil = System.currentTimeMillis() + STALE_FILTER_DURATION
+
+            bridgeHandler.sendVitalsToWeb("0", "0", "0", "0")
+            isSessionActive = true
             bridgeHandler.sendSignalToWeb("Measuring")
+
+            sessionTimeoutRunnable?.let { timeoutHandler.removeCallbacks(it) }
+            val timeoutTask = Runnable {
+                Log.w(TAG, "⏰ Session timeout reached. Forcing transmission.")
+                transmitFinalVitalsAndStop("TIMEOUT")
+            }
+            sessionTimeoutRunnable = timeoutTask
+            timeoutHandler.postDelayed(timeoutTask, timeoutSec * 1000L)
+
             triggerRealTimeVitals(gatt)
         } ?: run {
-            Log.e(TAG, "❌ Manual Trigger Failed: No active GATT connection.")
+            Log.e(TAG, "❌ Cannot start measurement: Device not connected.")
             bridgeHandler.sendSignalToWeb("Disconnected")
         }
     }
 
     @SuppressLint("MissingPermission")
     fun triggerRealTimeVitals(gatt: BluetoothGatt) {
-        // Mark session as active
-        isSessionActive = true
-
-        pendingSpo2 = null
-        pendingHr = null
-        pendingTemp = null
-
-        ignoreDataUntil = System.currentTimeMillis() + 2000
-
         writeChar?.let { wChar ->
-            Log.d(TAG, "📤 Step 1: Enabling Real-Time HR + Temperature...")
+            Log.d(TAG, "📤 Step 1: Enabling RealTimeStep data stream...")
             wChar.value = BleSDK.RealTimeStep(true, true)
             gatt.writeCharacteristic(wChar)
 
             Handler(Looper.getMainLooper()).postDelayed({
-                Log.d(TAG, "📤 Step 2: Triggering Device Measurement Type 3...")
-                wChar.value = BleSDK.StartDeviceMeasurementWithType(3, true, 60)
-                gatt.writeCharacteristic(wChar)
-            }, 1200)
-
-            Handler(Looper.getMainLooper()).postDelayed({
-                Log.d(TAG, "📤 Step 3: Explicitly requesting Oxygen reading...")
-                wChar.value = BleSDK.GetBloodOxygen(0x01.toByte(), "00000000")
-                gatt.writeCharacteristic(wChar)
-            }, 3000)
+                if (isSessionActive) {
+                    Log.d(TAG, "📤 Step 2: Explicitly requesting Blood Oxygen...")
+                    wChar.value = BleSDK.GetBloodOxygen(0x01.toByte(), "00000000")
+                    gatt.writeCharacteristic(wChar)
+                }
+            }, 10000)
         }
     }
 
     override fun onCreate() {
         super.onCreate()
-        Log.d(TAG, "🚀 SERVICE CREATED")
+        Log.i(TAG, "🚀 VitalsService Created")
         bridgeHandler = KioskBridgeHandler(this, client)
+        setupGattCallback()
         createNotificationChannel()
         startForeground(1, buildNotification())
-        setupGattCallback()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val action = intent?.getStringExtra("action")
         val macFromWeb = intent?.getStringExtra("wristbandId")
+        Log.d(TAG, "📥 onStartCommand Action: $action | MAC: $macFromWeb")
 
         when (action) {
             "DISCONNECT" -> {
@@ -165,60 +177,64 @@ class VitalsService : Service() {
                 performManualDisconnect()
                 stopSelf()
             }
-            "START_MEASUREMENT" -> {
-                startManualVitals()
-            }
-            else -> {
-                if (!macFromWeb.isNullOrEmpty()) {
-                    updateWristbandMacAndScan(macFromWeb)
-                }
-            }
+            "START_MEASUREMENT" -> startManualVitals()
+            else -> if (!macFromWeb.isNullOrEmpty()) updateWristbandMacAndScan(macFromWeb)
         }
         return START_STICKY
     }
 
-    @SuppressLint("MissingPermission")
     private fun setupGattCallback() {
         gattCallback = object : BluetoothGattCallback() {
+            @SuppressLint("MissingPermission")
             override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
+                val deviceAddr = gatt.device.address
                 if (status != BluetoothGatt.GATT_SUCCESS) {
+                    Log.e(TAG, "🔴 Connection Failed [Status: $status] for $deviceAddr. Closing GATT.")
                     gatt.close()
                     bluetoothGatt = null
                     if (!isManualDisconnect) {
+                        Log.i(TAG, "🔄 Retrying scan in 3 seconds...")
                         Handler(Looper.getMainLooper()).postDelayed({ startScanSafe() }, 3000)
                     }
                     return
                 }
 
                 if (newState == BluetoothProfile.STATE_CONNECTED) {
-                    Log.d(TAG, "✅ GATT Connected.")
+                    Log.i(TAG, "🟢 Connected to $deviceAddr. Discovering services...")
                     bridgeHandler.sendSignalToWeb("Connected")
                     gatt.discoverServices()
                 } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                    Log.d(TAG, "🔌 GATT Disconnected.")
+                    Log.w(TAG, "🟡 Disconnected from $deviceAddr.")
                     gatt.close()
                     bluetoothGatt = null
                     resetVitalsAndNotifyWeb()
-                    if (!isManualDisconnect) retryConnection(gatt.device)
+                    if (!isManualDisconnect) {
+                        Log.i(TAG, "🔄 Attempting reconnection to $deviceAddr...")
+                        retryConnection(gatt.device)
+                    }
                 }
             }
 
+            @SuppressLint("MissingPermission")
             override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
-                if (status != BluetoothGatt.GATT_SUCCESS) return
-                val targetService = gatt.services.firstOrNull { it.uuid == wristbandServiceUUID } ?: return
+                Log.d(TAG, "🔍 Services Discovered [Status: $status]")
+                val targetService = gatt.services.firstOrNull { it.uuid == wristbandServiceUUID }
+                if (targetService == null) {
+                    Log.e(TAG, "❌ Wristband Service NOT FOUND on this device.")
+                    return
+                }
 
                 writeChar = targetService.characteristics.firstOrNull {
                     (it.properties and BluetoothGattCharacteristic.PROPERTY_WRITE != 0) ||
                             (it.properties and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE != 0)
                 }
+                Log.d(TAG, "🖋️ Write Characteristic: ${if (writeChar != null) "FOUND" else "NOT FOUND"}")
 
-                val notifyChar = targetService.characteristics.firstOrNull {
-                    it.uuid == wristbandNotifyUUID && (it.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY != 0)
-                }
-
-                if (writeChar != null && notifyChar != null) {
-                    gatt.setCharacteristicNotification(notifyChar, true)
-                    notifyChar.getDescriptor(UUID.fromString("00002902-0000-1000-8000-00805f9b34fb"))?.apply {
+                val notifyChar = targetService.characteristics.firstOrNull { it.uuid == wristbandNotifyUUID }
+                notifyChar?.let {
+                    Log.d(TAG, "🔔 Enabling notifications for Vitals Data...")
+                    gatt.setCharacteristicNotification(it, true)
+                    it.getDescriptor(UUID.fromString("00002902-0000-1000-8000-00805f9b34fb"))?.apply {
                         value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
                         gatt.writeDescriptor(this)
                     }
@@ -230,81 +246,111 @@ class VitalsService : Service() {
                 val data = if (rawData.size < 30) rawData.copyOf(30) else rawData
                 val packetType = data[0].toInt() and 0xFF
 
-                if (System.currentTimeMillis() < ignoreDataUntil) return
-
-                // Only reset watchdog if we are currently in an active measurement session
-                if (isSessionActive) {
-                    resetWatchdog()
+                if (System.currentTimeMillis() < ignoreDataUntil) {
+                    Log.v(TAG, "⚠️ Ignoring stale packet 0x${Integer.toHexString(packetType)}")
+                    return
                 }
 
                 try {
                     when (packetType) {
-                        0x09 -> handleActivityData(data)
-                        0x28 -> handleMeasurementResponse(data)
-                        0x60 -> handleSpo2Data(data)
+                        0x28 -> {
+                            Log.v(TAG, "📦 Received Combined Packet (0x28)")
+                            handleCombinedPacket(data)
+                        }
+                        0x60 -> {
+                            Log.v(TAG, "📦 Received Dedicated SpO2 Packet (0x60)")
+                            handleDedicatedSpo2Packet(data)
+                        }
+                        0x09 -> {
+                            Log.v(TAG, "📦 Received Background Activity Packet (0x09)")
+                            handleBackgroundActivityPacket(data)
+                        }
+                        else -> Log.v(TAG, "📦 Received Unknown Packet Type: 0x${Integer.toHexString(packetType)}")
                     }
                 } catch (e: Exception) {
-                    Log.e(TAG, "💥 Error parsing packet: ${e.message}")
+                    Log.e(TAG, "💥 Parsing Error: ${e.message}")
                 }
             }
         }
     }
 
-    private fun handleMeasurementResponse(data: ByteArray) {
-        val subType = data[1].toInt() and 0xFF
-        if (subType == 3) {
-            val hr = ResolveUtil.getValue(data[2], 0).toString()
-            val spo2 = ResolveUtil.getValue(data[3], 0)
+    private fun handleCombinedPacket(data: ByteArray) {
+        if ((data[1].toInt() and 0xFF) == 3) {
+            val hrVal = ResolveUtil.getValue(data[2], 0)
+            val spo2Val = ResolveUtil.getValue(data[3], 0)
             val tempRaw = ResolveUtil.getValue(data[8], 0) + ResolveUtil.getValue(data[9], 1)
-            val nf = NumberFormat.getNumberInstance()
-            nf.maximumFractionDigits = 1
-            val tempStr = nf.format(tempRaw * 0.1)
-            updateVitalsBuffer(spo2, hr, tempStr)
+            val tempStr = String.format("%.1f", tempRaw * 0.1)
+            Log.d(TAG, "📥 [0x28] HR: $hrVal, SpO2: $spo2Val, Temp: $tempStr")
+            processVitalsUpdate(spo2Val, hrVal.toString(), tempStr)
         }
     }
 
-    private fun handleActivityData(data: ByteArray) {
-        val result = ResolveUtil.getActivityData(data)
-        val dic = result["dicData"] as? Map<String, String> ?: return
+    private fun handleDedicatedSpo2Packet(data: ByteArray) {
+        val res = ResolveUtil.getBloodoxygen(data)
+        val dicList = res["dicData"] as? List<Map<String, String>> ?: return
+        if (dicList.isNotEmpty()) {
+            val entry = dicList.last()
+            val oxygen = entry["Blood_oxygen"]?.toIntOrNull()
+            val hr = entry["heartRate"]
+            Log.d(TAG, "📥 [0x60] HR: $hr, SpO2: $oxygen")
+            processVitalsUpdate(oxygen, hr, null)
+        }
+    }
+
+    private fun handleBackgroundActivityPacket(data: ByteArray) {
+        val dic = ResolveUtil.getActivityData(data)["dicData"] as? Map<String, String> ?: return
+        val oxygen = dic["Blood_oxygen"]?.toIntOrNull()
         val hr = dic["heartRate"]
-        val spo2 = dic["Blood_oxygen"]?.toIntOrNull()
         val temp = dic["TempData"]
-        updateVitalsBuffer(spo2, hr, temp)
+        Log.d(TAG, "📥 [0x09] HR: $hr, SpO2: $oxygen, Temp: $temp")
+        processVitalsUpdate(oxygen, hr, temp)
     }
 
-    private fun handleSpo2Data(data: ByteArray) {
-        val result = ResolveUtil.getBloodoxygen(data)
-        val dicList = result["dicData"] as? List<Map<String, String>> ?: return
-        if (dicList.isEmpty()) return
-        val lastEntry = dicList.last()
-        val spo2 = lastEntry["Blood_oxygen"]?.toIntOrNull()
-        updateVitalsBuffer(spo2, null, null)
-    }
-
-    /**
-     * Simply updates the internal buffer without sending data to the UI yet.
-     */
-    private fun updateVitalsBuffer(spo2: Int?, hr: String?, temp: String?) {
-        if (spo2 != null && spo2 in 50..100) pendingSpo2 = spo2
+    private fun processVitalsUpdate(spo2: Int?, hr: String?, temp: String?) {
         val hrInt = hr?.toIntOrNull() ?: 0
-        if (hrInt in 30..220) pendingHr = hr
-        if (!temp.isNullOrEmpty() && temp != "0.0" && temp != "0") pendingTemp = temp
+        if (hrInt > 30) pendingHr = hr
+
+        val tempDbl = temp?.toDoubleOrNull() ?: 0.0
+        if (tempDbl > 32.0) pendingTemp = temp
+
+        val oxygen = spo2 ?: 0
+        if (oxygen in 70..100) pendingSpo2 = oxygen
+
+        if (isSessionActive) {
+            if (hrInt > 40) hrCounter++
+            if (oxygen in 71..100) spo2Counter++
+            if (tempDbl > 34.0) tempCounter++
+
+            val h = pendingHr ?: "0"
+            val t = pendingTemp ?: "0.0"
+            val s = pendingSpo2?.toString() ?: "0"
+
+            // Log real-time status and stability counters
+            Log.i(TAG, "📉 Live -> HR:$h ($hrCounter), SpO2:$s% ($spo2Counter), Temp:$t°C ($tempCounter) | Target: $SAMPLES_REQUIRED")
+
+            bridgeHandler.sendVitalsToWeb(s, h, t, System.currentTimeMillis().toString())
+
+            if (hrCounter >= SAMPLES_REQUIRED && spo2Counter >= SAMPLES_REQUIRED && tempCounter >= SAMPLES_REQUIRED) {
+                transmitFinalVitalsAndStop("STABILIZED")
+            }
+        }
     }
 
     private fun resetVitalsAndNotifyWeb() {
+        Log.d(TAG, "🧹 Resetting session counters and notifying web.")
+        sessionTimeoutRunnable?.let { timeoutHandler.removeCallbacks(it) }
         isSessionActive = false
-        pendingSpo2 = null
-        pendingHr = null
-        pendingTemp = null
-        watchdogHandler.removeCallbacks(watchdogRunnable)
-        bridgeHandler.sendVitalsToWeb("0", "0", "0", "Disconnected")
+        spo2Counter = 0
+        hrCounter = 0
+        tempCounter = 0
+        bridgeHandler.sendSignalToWeb("Disconnected")
     }
 
     @SuppressLint("MissingPermission")
     private fun startScanSafe() {
+        Log.i(TAG, "🔎 Starting BLE Scan for Mac: $wristbandMac")
         val manager = getSystemService(BLUETOOTH_SERVICE) as BluetoothManager
         val adapter = manager.adapter ?: return
-        if (!adapter.isEnabled) return
         bluetoothLeScanner = adapter.bluetoothLeScanner ?: return
         val settings = ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build()
         bluetoothLeScanner?.startScan(null, settings, scanCallback)
@@ -313,17 +359,21 @@ class VitalsService : Service() {
     private val scanCallback = object : ScanCallback() {
         @SuppressLint("MissingPermission")
         override fun onScanResult(callbackType: Int, result: ScanResult) {
-            if (result.device.address.equals(wristbandMac, ignoreCase = true)) {
+            val device = result.device
+            if (device.address.equals(wristbandMac, ignoreCase = true)) {
+                Log.i(TAG, "🎯 Found target device: ${device.name} [${device.address}]")
                 bluetoothLeScanner?.stopScan(this)
-                bluetoothGatt = result.device.connectGatt(this@VitalsService, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
+                bluetoothGatt = device.connectGatt(this@VitalsService, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
             }
         }
     }
 
     @SuppressLint("MissingPermission")
     private fun retryConnection(device: BluetoothDevice) {
+        Log.i(TAG, "🔄 Retrying connection to ${device.address}...")
         Handler(Looper.getMainLooper()).postDelayed({
             if (bluetoothGatt == null) {
+                Log.d(TAG, "🔌 Initiating reconnect connectGatt...")
                 bluetoothGatt = device.connectGatt(this, false, gattCallback)
             }
         }, 2500)
@@ -331,10 +381,15 @@ class VitalsService : Service() {
 
     @SuppressLint("MissingPermission")
     private fun performManualDisconnect() {
+        Log.i(TAG, "🔌 Manual Disconnect Requested.")
+        sessionTimeoutRunnable?.let { timeoutHandler.removeCallbacks(it) }
         isSessionActive = false
-        watchdogHandler.removeCallbacks(watchdogRunnable)
+        spo2Counter = 0
+        hrCounter = 0
+        tempCounter = 0
         bluetoothLeScanner?.stopScan(scanCallback)
         bluetoothGatt?.apply {
+            Log.d(TAG, "🔌 Closing GATT Connection...")
             disconnect()
             close()
         }
@@ -347,21 +402,19 @@ class VitalsService : Service() {
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel("vitals_channel", "Vitals Service", NotificationManager.IMPORTANCE_LOW)
+            val channel = NotificationChannel("vitals_channel", "Vitals Sync", NotificationManager.IMPORTANCE_LOW)
             getSystemService(NotificationManager::class.java)?.createNotificationChannel(channel)
         }
     }
 
     private fun buildNotification() = NotificationCompat.Builder(this, "vitals_channel")
-        .setContentTitle("VitalSync Active")
-        .setContentText("Monitoring health data...")
-        .setSmallIcon(android.R.drawable.stat_notify_sync)
-        .build()
+        .setContentTitle("VitalSync Pro Active").setContentText("Monitoring health data...").setSmallIcon(android.R.drawable.stat_notify_sync).build()
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     @SuppressLint("MissingPermission")
     override fun onDestroy() {
+        Log.i(TAG, "💀 VitalsService Destroyed")
         performManualDisconnect()
         super.onDestroy()
     }

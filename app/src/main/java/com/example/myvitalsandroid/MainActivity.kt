@@ -1,67 +1,51 @@
-
 package com.example.myvitalsandroid
 
 import android.Manifest
 import android.annotation.SuppressLint
-import android.app.NotificationChannel
-import android.app.NotificationManager
-import android.app.Service
-import android.content.pm.ApplicationInfo
 import android.bluetooth.*
-import android.bluetooth.le.*
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.location.LocationManager
 import android.os.*
 import android.provider.Settings
 import android.util.Log
-import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
 import android.webkit.*
-import androidx.compose.material3.Button
-import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
-import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.fillMaxSize
+import androidx.annotation.RequiresApi
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.*
+import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.viewinterop.AndroidView
-import android.webkit.JavascriptInterface
 import androidx.core.app.ActivityCompat
-import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
-import com.jstyle.blesdk2208a.Util.BleSDK
-import com.jstyle.blesdk2208a.Util.ResolveUtil
-import com.jstyle.blesdk2208a.model.AutoMode
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
-import org.json.JSONObject
-import java.util.*
-import java.util.concurrent.TimeUnit
+import androidx.core.view.WindowCompat
 
 /**
- * Merged MainActivity: Manages WebView UI, Connectivity Status, and Permissions.
- * Fixed to correctly reference VitalsService within the same package.
+ * Merged MainActivity: Manages WebView UI with a Top Brand Bar,
+ * Connectivity Status, and Bluetooth Permissions.
  */
 class MainActivity : ComponentActivity() {
 
     private val PERMISSION_REQ = 2001
-
-
+    private var currentStatus by mutableStateOf("Disconnected")
 
     private val REQUIRED_PERMISSIONS = mutableListOf(
         Manifest.permission.ACCESS_FINE_LOCATION,
@@ -79,9 +63,8 @@ class MainActivity : ComponentActivity() {
         }
     }.toTypedArray()
 
-    // This class receives the data from your Next.js "window.Android.onKioskSelected"
+    // JavaScript Bridge to communicate with the Web App
     inner class WebAppInterface(private val context: Context) {
-
         @JavascriptInterface
         fun onKioskSelected(wristbandId: String) {
             Log.d("MainActivity", "Bridge: Connecting to MAC $wristbandId")
@@ -107,7 +90,6 @@ class MainActivity : ComponentActivity() {
             context.startService(intent)
         }
 
-        // ADD THIS METHOD - This is what your "Get Vitals" button calls!
         @JavascriptInterface
         fun triggerMeasurement() {
             Log.d("MainActivity", "Bridge: Manual Measurement Triggered")
@@ -117,14 +99,9 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private var currentStatus by mutableStateOf("Disconnected")
-
     private val vitalsReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             val jsonData = intent?.getStringExtra("data") ?: return
-            Log.d("MainActivity", "Sending to WebView: $jsonData")
-
-            // This pushes the data into the window.receiveVitals() function in your Web App
             KioskBridgeHandler.activeWebView?.evaluateJavascript(
                 "if(window.receiveVitals) { window.receiveVitals($jsonData); }",
                 null
@@ -142,6 +119,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
         if (0 != (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE)) {
             WebView.setWebContentsDebuggingEnabled(true)
         }
@@ -149,11 +127,23 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
 
         setContent {
-            // Using a fallback URL if needed, but keeping your original URL as requested.
-            MyVitalsAppWebView("https://child-life-project-git-v120-ezshifas-projects.vercel.app/", currentStatus)
+            // --- UI Setup: System Status Bar Coloring ---
+            val view = LocalView.current
+            if (!view.isInEditMode) {
+                SideEffect {
+                    val window = (view.context as android.app.Activity).window
+                    window.statusBarColor = android.graphics.Color.parseColor("#0088d6")
+                    // Ensure status bar icons (clock/battery) are white
+                    WindowCompat.getInsetsController(window, view).isAppearanceLightStatusBars = false
+                }
+            }
+
+            MyVitalsAppWebView(
+                url = "https://child-life-project-git-v120-ezshifas-projects.vercel.app/",
+                status = currentStatus
+            )
         }
 
-        // Initial permission check and connection attempt
         if (hasAllPermissions()) {
             checkBluetoothAndLocation()
         } else {
@@ -161,6 +151,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    // --- Permission Logic ---
     private fun hasAllPermissions(): Boolean =
         REQUIRED_PERMISSIONS.all { ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED }
 
@@ -168,16 +159,10 @@ class MainActivity : ComponentActivity() {
         ActivityCompat.requestPermissions(this, REQUIRED_PERMISSIONS, PERMISSION_REQ)
     }
 
-    override fun onRequestPermissionsResult(
-        requestCode: Int, permissions: Array<out String>, grantResults: IntArray
-    ) {
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == PERMISSION_REQ) {
-            if (grantResults.isNotEmpty() && grantResults.all { it == PackageManager.PERMISSION_GRANTED }) {
-                checkBluetoothAndLocation()
-            } else {
-                Toast.makeText(this, "Permissions are required for wristband sync!", Toast.LENGTH_LONG).show()
-            }
+        if (requestCode == PERMISSION_REQ && grantResults.all { it == PackageManager.PERMISSION_GRANTED }) {
+            checkBluetoothAndLocation()
         }
     }
 
@@ -188,52 +173,31 @@ class MainActivity : ComponentActivity() {
             Toast.makeText(this, "Please enable Bluetooth", Toast.LENGTH_SHORT).show()
             return
         }
-
         val lm = getSystemService(Context.LOCATION_SERVICE) as LocationManager
-        val locEnabled = try {
-            lm.isProviderEnabled(LocationManager.GPS_PROVIDER) || lm.isProviderEnabled(LocationManager.NETWORK_PROVIDER)
-        } catch (e: Exception) {
-            false
-        }
+        val locEnabled = try { lm.isProviderEnabled(LocationManager.GPS_PROVIDER) || lm.isProviderEnabled(LocationManager.NETWORK_PROVIDER) } catch (e: Exception) { false }
 
         if (!locEnabled) {
-            Toast.makeText(this, "Please enable Location Services", Toast.LENGTH_SHORT).show()
             startActivity(Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS))
             return
         }
-
         startVitalsService()
     }
 
     private fun startVitalsService() {
-        // Explicitly ensuring VitalsService is found by staying in the same package
         val intent = Intent(this, VitalsService::class.java)
-        try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                startForegroundService(intent)
-            } else {
-                startService(intent)
-            }
-        } catch (e: Exception) {
-            Log.e("MainActivity", "Failed to start service: ${e.message}")
-        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(intent)
+        else startService(intent)
     }
 
-    private fun stopVitalsService() {
-        val intent = Intent(this, VitalsService::class.java)
-        stopService(intent)
-    }
-
+    @RequiresApi(Build.VERSION_CODES.O)
     override fun onResume() {
         super.onResume()
         val filter = IntentFilter("com.example.myvitalsandroid.CONNECTION_STATUS")
-        // Filter for Vitals Data
         val vitalsFilter = IntentFilter("com.example.myvitalsandroid.VITALS_DATA")
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            registerReceiver(connectionReceiver, filter, Context.RECEIVER_EXPORTED)
-        } else {
-            registerReceiver(connectionReceiver, filter)
-        }
+
+        val receiverFlags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) Context.RECEIVER_EXPORTED else 0
+        registerReceiver(connectionReceiver, filter, receiverFlags)
+        registerReceiver(vitalsReceiver, vitalsFilter, receiverFlags)
     }
 
     override fun onPause() {
@@ -241,9 +205,7 @@ class MainActivity : ComponentActivity() {
         try {
             unregisterReceiver(connectionReceiver)
             unregisterReceiver(vitalsReceiver)
-        } catch (e: Exception) {
-            // Already unregistered
-        }
+        } catch (e: Exception) { }
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -258,65 +220,69 @@ class MainActivity : ComponentActivity() {
             else finish()
         }
 
-        Box(modifier = Modifier.fillMaxSize()) {
-            if (isOffline) {
-                // Simplified UI for when offline if R.layout.no_internet_view is missing in your resources
-                Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                    Button(onClick = {
-                        isOffline = false
-                        isLoading = true
-                        webViewRef?.reload()
-                    }) {
-                        androidx.compose.material3.Text("Retry Connection")
+        // --- Main UI Structure ---
+        Column(modifier = Modifier.fillMaxSize()) {
+
+            // 1. Top Brand Bar (Fills the Status Bar area)
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .windowInsetsPadding(WindowInsets.statusBars)
+                    .background(Color(0x0088d6))
+            )
+
+            // 2. Main Content (WebView)
+            Box(modifier = Modifier.weight(1f)) {
+                if (isOffline) {
+                    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                        Button(onClick = {
+                            isOffline = false
+                            isLoading = true
+                            webViewRef?.reload()
+                        }) {
+                            Text("Retry Connection")
+                        }
                     }
-                }
-            } else {
-                AndroidView(
-                    factory = { ctx ->
-                        WebView(ctx).apply {
-                            KioskBridgeHandler.activeWebView = this
-                            layoutParams = ViewGroup.LayoutParams(
-                                ViewGroup.LayoutParams.MATCH_PARENT,
-                                ViewGroup.LayoutParams.MATCH_PARENT
-                            )
-
-                            addJavascriptInterface(WebAppInterface(ctx), "Android")
-
-                            webViewClient = object : WebViewClient() {
-                                override fun onPageStarted(v: WebView?, u: String?, f: Bitmap?) {
-                                    isLoading = true
-                                }
-                                override fun onPageFinished(v: WebView?, u: String?) {
-                                    isLoading = false
-                                }
-                                override fun onReceivedError(v: WebView?, req: WebResourceRequest?, err: WebResourceError?) {
-                                    if (req?.isForMainFrame == true) {
-                                        isOffline = true
-                                        isLoading = false
+                } else {
+                    AndroidView(
+                        factory = { ctx ->
+                            WebView(ctx).apply {
+                                KioskBridgeHandler.activeWebView = this
+                                layoutParams = ViewGroup.LayoutParams(
+                                    ViewGroup.LayoutParams.MATCH_PARENT,
+                                    ViewGroup.LayoutParams.MATCH_PARENT
+                                )
+                                addJavascriptInterface(WebAppInterface(ctx), "Android")
+                                webViewClient = object : WebViewClient() {
+                                    override fun onPageStarted(v: WebView?, u: String?, f: Bitmap?) { isLoading = true }
+                                    override fun onPageFinished(v: WebView?, u: String?) { isLoading = false }
+                                    override fun onReceivedError(v: WebView?, req: WebResourceRequest?, err: WebResourceError?) {
+                                        if (req?.isForMainFrame == true) {
+                                            isOffline = true
+                                            isLoading = false
+                                        }
                                     }
                                 }
+                                settings.apply {
+                                    javaScriptEnabled = true
+                                    domStorageEnabled = true
+                                    databaseEnabled = true
+                                    mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                                    loadWithOverviewMode = true
+                                    useWideViewPort = true
+                                }
+                                loadUrl(url)
+                                webViewRef = this
                             }
-                            settings.apply {
-                                javaScriptEnabled = true
-                                domStorageEnabled = true
-                                databaseEnabled = true
-                                cacheMode = WebSettings.LOAD_DEFAULT
-                                loadWithOverviewMode = true
-                                useWideViewPort = true
-                                // Enable mixed content if necessary for some assets
-                                mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
-                            }
-                            loadUrl(url)
-                            webViewRef = this
-                        }
-                    },
-                    modifier = Modifier.fillMaxSize()
-                )
-            }
+                        },
+                        modifier = Modifier.fillMaxSize()
+                    )
+                }
 
-            if (isLoading && !isOffline) {
-                Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                    CircularProgressIndicator(color = Color(0xFF2563EB))
+                if (isLoading && !isOffline) {
+                    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                        CircularProgressIndicator(color = Color(0xFF007EAF))
+                    }
                 }
             }
         }
