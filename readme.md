@@ -1,4 +1,4 @@
-# Child Life Vitals System 🩺
+# MyVitals 🩺
 
 > A full-stack IoT solution for real-time pediatric vital sign monitoring — built for the bedside, designed for care.
 
